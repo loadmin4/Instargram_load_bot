@@ -67,10 +67,12 @@ class SearchReport:
     mode: str = "lens"  # "lens" | "crawl"
     targets: tuple[str, ...] = ()  # crawl 모드에서 뒤진 대상 (@계정, #해시태그)
     errors: list[str] = field(default_factory=list)  # 일부 대상 실패 등 (검색은 계속됨)
+    note: str | None = None  # 결과 위에 덧붙일 설명 (예: AI 가 고른 검색 대상)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "mode": self.mode,
+            "note": self.note,
             "total_results": self.total_results,
             "search_types": list(self.search_types),
             "targets": list(self.targets),

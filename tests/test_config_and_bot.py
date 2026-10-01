@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from insta_finder.ai_targets import SuggestionError, TargetSuggestion
 from insta_finder.config import Settings
 from insta_finder.crawler import LoginError, Target
 from insta_finder.models import InstagramRef, Match, SearchReport
@@ -159,11 +160,13 @@ class FakeFinder:
         return self.result
 
 
-def make_bot(lens=None, crawl=None, allowed=()):
+def make_bot(lens=None, crawl=None, allowed=(), suggester=None):
     env = {"TELEGRAM_BOT_TOKEN": "1:t"}
     if allowed:
         env["ALLOWED_USER_IDS"] = ",".join(str(a) for a in allowed)
-    return InstaFinderBot(Settings.from_env(env), lens_finder=lens, crawl_finder=crawl)
+    return InstaFinderBot(
+        Settings.from_env(env), lens_finder=lens, crawl_finder=crawl, suggester=suggester
+    )
 
 
 def run_handler(bot, message, user_id=7, user_data=None):
@@ -266,7 +269,7 @@ def test_caption_with_targets_uses_crawl():
 
 def test_crawl_progress_updates_status():
     class SlowFinder(FakeFinder):
-        def find(self, data, targets, progress):
+        def find(self, data, targets, progress, max_posts=None):
             import time
 
             progress(12, "@gildong")
@@ -304,3 +307,92 @@ def test_crawl_login_error_message():
     run_handler(make_bot(crawl=crawl), message)
     assert "로그인 문제" in message.edits[-1]
     assert "세션이 만료됐어요." in message.edits[-1]
+
+
+class FakeSuggester:
+    def __init__(self, result):
+        self.result = result
+        self.calls = []
+
+    def suggest(self, data, hint=None):
+        self.calls.append((data, hint))
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
+
+
+class RecordingCrawl(FakeFinder):
+    def find(self, data, targets, progress=None, max_posts=None):
+        self.calls.append((data, targets, max_posts))
+        return self.result
+
+
+def test_ai_picks_targets_when_caption_has_none():
+    suggestion = TargetSuggestion(
+        description="제주 성산일출봉 일출 사진",
+        targets=[Target("hashtag", "성산일출봉"), Target("hashtag", "제주일출")],
+    )
+    suggester = FakeSuggester(suggestion)
+    crawl, lens = RecordingCrawl(crawl_report()), FakeFinder(SearchReport())
+    message = FakeMessage(photo=[FakeAttachment()], caption="제주도 여행 사진이에요")
+    run_handler(make_bot(lens=lens, crawl=crawl, suggester=suggester), message)
+
+    assert suggester.calls == [(b"image-bytes", "제주도 여행 사진이에요")]  # 캡션은 힌트로 전달
+    assert crawl.calls == [(b"image-bytes", suggestion.targets, 100)]  # AI_MAX_POSTS 기본값
+    assert lens.calls == []
+    assert "AI 가 사진을 보고" in message.replies[0]
+    assert any("#성산일출봉 #제주일출 의 게시물과 비교하는 중" in t for t in message.edits)
+    final = message.edits[-1]
+    assert final.startswith("🤖 AI 분석: 제주 성산일출봉 일출 사진")
+    assert "같은 사진 1건" in final
+
+
+def test_explicit_targets_skip_ai():
+    suggester = FakeSuggester(TargetSuggestion(description="x"))
+    crawl = RecordingCrawl(crawl_report())
+    message = FakeMessage(photo=[FakeAttachment()], caption="@gildong")
+    run_handler(make_bot(crawl=crawl, suggester=suggester), message)
+    assert suggester.calls == []
+    assert crawl.calls == [(b"image-bytes", [Target("profile", "gildong")], None)]
+
+
+def test_ai_without_clues_falls_back_to_lens():
+    suggester = FakeSuggester(TargetSuggestion(description="흰 배경의 컵 사진", targets=[]))
+    crawl, lens = RecordingCrawl(crawl_report()), FakeFinder(SearchReport())
+    message = FakeMessage(photo=[FakeAttachment()])
+    run_handler(make_bot(lens=lens, crawl=crawl, suggester=suggester), message)
+    assert crawl.calls == []
+    assert lens.calls == [(b"image-bytes",)]
+
+
+def test_ai_without_clues_and_no_lens_asks_for_hint():
+    suggester = FakeSuggester(TargetSuggestion(description="흰 배경의 컵 사진", targets=[]))
+    message = FakeMessage(photo=[FakeAttachment()])
+    run_handler(make_bot(crawl=RecordingCrawl(crawl_report()), suggester=suggester), message)
+    assert "흰 배경의 컵 사진" in message.edits[-1]
+    assert "단서를 얻지 못했어요" in message.edits[-1]
+
+
+def test_ai_error_message():
+    suggester = FakeSuggester(SuggestionError("Claude API 키가 올바르지 않아요."))
+    message = FakeMessage(photo=[FakeAttachment()])
+    run_handler(make_bot(crawl=RecordingCrawl(crawl_report()), suggester=suggester), message)
+    assert "AI 사진 분석에 실패했어요" in message.edits[-1]
+    assert "API 키" in message.edits[-1]
+
+
+def test_ai_requires_crawl():
+    # 크롤링이 없으면 AI 가 대상을 골라도 쓸 수 없으므로 꺼진다
+    bot = make_bot(lens=FakeFinder(SearchReport()), suggester=FakeSuggester(None))
+    assert bot.suggester is None
+
+
+def test_settings_ai():
+    base = {"INSTAGRAM_USERNAME": "me", "ANTHROPIC_API_KEY": "sk-ant-x"}
+    settings = Settings.from_env(base)
+    assert settings.ai_enabled
+    assert settings.ai_model == "claude-opus-5-5"
+    assert settings.ai_max_posts == 100
+    assert "sk-ant-x" not in repr(settings)
+    assert not Settings.from_env({"ANTHROPIC_API_KEY": "sk-ant-x"}).ai_enabled
+    assert Settings.from_env({**base, "AI_MAX_POSTS": "30"}).ai_max_posts == 30

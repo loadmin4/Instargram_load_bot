@@ -3,8 +3,11 @@
     # 크롤링: 로그인한 인스타그램 세션으로 지정한 계정/해시태그의 게시물과 비교
     python -m insta_finder 사진.jpg -t @gildong -t "#제주도"
 
-    # Google Lens(SerpApi): 인스타그램 전체에서 찾기
-    python -m insta_finder 사진.jpg
+    # AI + 크롤링: Claude 가 사진을 보고 뒤질 해시태그/계정을 골라서 비교 (ANTHROPIC_API_KEY)
+    python -m insta_finder 사진.jpg --hint "제주도 여행"
+
+    # Google Lens(SerpApi): 인스타그램 전체에서 찾기 (AI 가 꺼져 있거나 --lens 일 때)
+    python -m insta_finder 사진.jpg --lens
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ import logging
 import sys
 from pathlib import Path
 
+from .ai_targets import SuggestionError, TargetSuggester
 from .config import Settings
 from .crawl_finder import CrawlFinder
 from .crawler import CrawlerError, InstagramSession, LoginError, parse_targets
@@ -39,6 +43,8 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="@계정|#태그",
         help="이 계정/해시태그의 게시물을 직접 비교 (여러 번 지정 가능, 인스타그램 로그인 필요)",
     )
+    parser.add_argument("--hint", help="AI: 사진에 대한 힌트 (장소 이름 등)")
+    parser.add_argument("--lens", action="store_true", help="AI 대신 Google Lens 로 검색")
     parser.add_argument("--json", action="store_true", help="결과를 JSON 으로 출력")
     parser.add_argument("--max-posts", type=int, help="크롤링: 대상 하나당 비교할 최대 게시물 수")
     parser.add_argument("--threshold", type=float, help="크롤링: 같은 사진으로 볼 유사도 (0~1)")
@@ -105,11 +111,23 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    if not targets and not settings.lens_enabled:
+    use_ai = not targets and settings.ai_enabled and not args.lens
+    if args.lens and not settings.lens_enabled:
+        print("--lens 를 쓰려면 SERPAPI_API_KEY 를 설정하세요.", file=sys.stderr)
+        return 2
+    if not targets and settings.anthropic_api_key and not settings.crawl_enabled and not settings.lens_enabled:
+        print(
+            "AI 가 고른 대상을 크롤링하려면 인스타그램 로그인이 필요해요. "
+            ".env 에 INSTAGRAM_USERNAME 을 설정하고 `python -m insta_finder.login` 을 실행하세요.",
+            file=sys.stderr,
+        )
+        return 2
+    if not targets and not use_ai and not settings.lens_enabled:
         print(
             "어디서 찾을지 -t @계정 또는 -t \"#해시태그\" 로 지정하세요.\n"
             "(인스타그램에는 사진 검색 기능이 없어서 뒤질 대상이 필요합니다. "
-            "전체 검색은 SERPAPI_API_KEY 를 설정하면 쓸 수 있어요.)",
+            "ANTHROPIC_API_KEY 를 설정하면 AI 가 대상을 골라주고, "
+            "SERPAPI_API_KEY 를 설정하면 Google Lens 로 전체 검색할 수 있어요.)",
             file=sys.stderr,
         )
         return 2
@@ -130,10 +148,30 @@ def main(argv: list[str] | None = None) -> int:
 
     closers = []
     try:
+        note = None
+        max_posts = None
+        if use_ai:
+            print("AI 가 사진을 분석하는 중...", file=sys.stderr)
+            suggestion = TargetSuggester(
+                model=settings.ai_model, max_targets=crawl_options.max_targets
+            ).suggest(image_bytes, hint=args.hint)
+            print(f"  {suggestion.description}", file=sys.stderr)
+            if not suggestion.targets:
+                print(
+                    "AI 가 사진에서 단서를 찾지 못했어요. --hint 로 장소 이름 등을 알려주거나 "
+                    "-t 로 대상을 직접 지정하세요.",
+                    file=sys.stderr,
+                )
+                return 1
+            targets = suggestion.targets
+            note = suggestion.summary()
+            max_posts = args.max_posts or settings.ai_max_posts
+            print(f"  대상: {' '.join(str(t) for t in targets)}", file=sys.stderr)
         if targets:
             crawl_finder = CrawlFinder(session, crawl_options)
             closers.append(crawl_finder.close)
-            report = crawl_finder.find(image_bytes, targets, progress=_progress)
+            report = crawl_finder.find(image_bytes, targets, progress=_progress, max_posts=max_posts)
+            report.note = note
             print(file=sys.stderr)
         else:
             client = SerpApiClient(
@@ -149,6 +187,9 @@ def main(argv: list[str] | None = None) -> int:
             report = finder.find(image_bytes)
     except InvalidImageError as exc:
         print(str(exc), file=sys.stderr)
+        return 1
+    except SuggestionError as exc:
+        print(f"AI 분석 실패: {exc}", file=sys.stderr)
         return 1
     except (LoginError, CrawlerError) as exc:
         print(f"\n인스타그램 오류: {exc}", file=sys.stderr)

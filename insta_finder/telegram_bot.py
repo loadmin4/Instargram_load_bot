@@ -2,10 +2,12 @@
 
     python -m insta_finder.telegram_bot
 
-두 가지 검색 방식:
+검색 방식:
   - 크롤링: 사진 설명(캡션)에 @계정 이나 #해시태그 를 적으면, 로그인한 인스타그램 세션으로
             그 게시물들을 직접 내려받아 비교한다. (INSTAGRAM_USERNAME 필요)
-  - Google Lens: 캡션 없이 보내면 Google Lens 로 인스타그램 전체에서 찾는다. (SERPAPI_API_KEY 필요)
+  - AI + 크롤링: @/# 없이 보내면 Claude 가 사진을 보고 뒤질 해시태그/계정을 추정한 뒤 크롤링한다.
+            캡션의 글은 힌트로 쓴다. (ANTHROPIC_API_KEY + INSTAGRAM_USERNAME 필요)
+  - Google Lens: 위 방식을 쓸 수 없을 때 Google Lens 로 인스타그램 전체에서 찾는다. (SERPAPI_API_KEY 필요)
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ from telegram.ext import (
     filters,
 )
 
+from .ai_targets import SuggestionError, TargetSuggester
 from .config import Settings
 from .crawl_finder import CrawlFinder
 from .crawler import CrawlerError, InstagramSession, LoginError, Target, parse_targets
@@ -44,7 +47,7 @@ NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 TARGET_EXAMPLE = "예) 사진 설명에  @gildong #제주도  처럼 적어서 보내기"
 
 
-def help_text(lens: bool, crawl: bool) -> str:
+def help_text(lens: bool, crawl: bool, ai: bool = False) -> str:
     lines = ["📷 사진을 보내주시면 인스타그램에서 그 사진이 올라간 게시물과 올린 사용자를 찾아드려요.\n"]
     if crawl:
         lines.append(
@@ -52,7 +55,12 @@ def help_text(lens: bool, crawl: bool) -> str:
             "  그 게시물들을 하나씩 직접 비교해서 찾아요.\n"
             f"  {TARGET_EXAMPLE}"
         )
-    if lens:
+    if ai:
+        lines.append(
+            "• 어디서 찾을지 모르겠으면 그냥 보내세요. AI 가 사진 속 장소·간판·워터마크를 보고\n"
+            "  해시태그/계정을 추정해서 찾아요. 캡션에 '성산일출봉'처럼 힌트를 적으면 더 정확해요."
+        )
+    elif lens:
         lines.append("• 캡션 없이 보내면 Google Lens 로 인스타그램 전체에서 찾아요.")
     elif crawl:
         lines.append("• 인스타그램에는 사진 검색 기능이 없어서, 뒤질 계정/해시태그를 꼭 적어야 해요.")
@@ -93,6 +101,7 @@ class InstaFinderBot:
         *,
         lens_finder: Any = None,
         crawl_finder: Any = None,
+        suggester: Any = None,
     ) -> None:
         self.settings = settings
         self.instagram: InstagramSession | None = None
@@ -114,8 +123,14 @@ class InstaFinderBot:
                 settings.finder,
                 owner_lookup=self.instagram.post_owner if self.instagram else None,
             )
+        if suggester is None and settings.ai_enabled:
+            suggester = TargetSuggester(
+                model=settings.ai_model, max_targets=settings.crawl.max_targets
+            )
         self.lens_finder = lens_finder
         self.crawl_finder = crawl_finder
+        # AI 는 크롤링할 대상을 고르는 역할이므로 크롤링이 가능할 때만 쓴다
+        self.suggester = suggester if crawl_finder is not None else None
         # 인스타그램 요청이 몰리지 않도록 크롤링 검색은 한 번에 하나만
         self._crawl_lock = asyncio.Lock()
 
@@ -134,7 +149,11 @@ class InstaFinderBot:
             await message.reply_text(self._denied_text(update))
             return
         await message.reply_text(
-            help_text(lens=self.lens_finder is not None, crawl=self.crawl_finder is not None)
+            help_text(
+                lens=self.lens_finder is not None,
+                crawl=self.crawl_finder is not None,
+                ai=self.suggester is not None,
+            )
         )
 
     async def not_an_image(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -161,13 +180,15 @@ class InstaFinderBot:
             await message.reply_text("20MB 이하의 사진만 검색할 수 있어요.")
             return
 
-        targets = parse_targets(getattr(message, "caption", None))
+        caption = getattr(message, "caption", None)
+        targets = parse_targets(caption)
+        use_ai = not targets and self.suggester is not None
         if targets and self.crawl_finder is None:
             await message.reply_text(
                 "계정/해시태그 검색(크롤링)이 설정되지 않았어요. .env 에 INSTAGRAM_USERNAME 을 설정하세요."
             )
             return
-        if not targets and self.lens_finder is None:
+        if not targets and not use_ai and self.lens_finder is None:
             await message.reply_text(
                 "어디서 찾을지 알려주세요. 인스타그램에는 사진 검색 기능이 없어서\n"
                 f"뒤질 계정(@아이디)이나 해시태그(#태그)가 필요해요.\n{TARGET_EXAMPLE}"
@@ -183,6 +204,8 @@ class InstaFinderBot:
         if targets:
             shown = ", ".join(str(t) for t in targets[: self.settings.crawl.max_targets])
             status = await message.reply_text(f"🔎 {shown} 의 게시물과 비교하는 중이에요...")
+        elif use_ai:
+            status = await message.reply_text("🤖 AI 가 사진을 보고 어디서 찾을지 고르는 중이에요...")
         else:
             status = await message.reply_text("🔎 인스타그램에서 찾는 중이에요... (보통 10~30초)")
         try:
@@ -190,10 +213,14 @@ class InstaFinderBot:
             file = await attachment.get_file()
             data = bytes(await file.download_as_bytearray())
             if targets:
-                report = await self._crawl(status, data, targets)
+                text = format_report(await self._crawl(status, data, targets))
+            elif use_ai:
+                text = await self._ai_search(status, data, caption)
             else:
-                report = await asyncio.to_thread(self.lens_finder.find, data)
-            text = format_report(report)
+                text = format_report(await asyncio.to_thread(self.lens_finder.find, data))
+        except SuggestionError as exc:
+            log.warning("AI 분석 실패: %s", exc)
+            text = f"AI 사진 분석에 실패했어요.\n{exc}\n\n{TARGET_EXAMPLE}"
         except InvalidImageError:
             text = "이미지를 읽을 수 없어요. JPG/PNG/WebP 사진을 보내주세요."
         except LoginError as exc:
@@ -213,8 +240,36 @@ class InstaFinderBot:
 
         await self._reply_long(status, text)
 
+    # ------------------------------------------------------------------ AI + 크롤링
+    async def _ai_search(self, status: Message, data: bytes, hint: str | None) -> str:
+        suggestion = await asyncio.to_thread(self.suggester.suggest, data, hint)
+        if not suggestion.targets:
+            if self.lens_finder is not None:
+                await self._edit_quietly(status, "🔎 AI 가 단서를 찾지 못해 Google Lens 로 찾는 중이에요...")
+                return format_report(await asyncio.to_thread(self.lens_finder.find, data))
+            return (
+                f"🤖 AI 분석: {suggestion.description}\n\n"
+                "사진에서 어디서 찾을지 단서를 얻지 못했어요.\n"
+                f"캡션에 장소 이름 같은 힌트를 적거나, 뒤질 계정/해시태그를 직접 적어주세요.\n{TARGET_EXAMPLE}"
+            )
+        shown = " ".join(str(t) for t in suggestion.targets)
+        await self._edit_quietly(
+            status, f"🤖 {suggestion.description}\n🔎 {shown} 의 게시물과 비교하는 중이에요..."
+        )
+        report = await self._crawl(
+            status, data, suggestion.targets, max_posts=self.settings.ai_max_posts
+        )
+        report.note = suggestion.summary()
+        return format_report(report)
+
     # ------------------------------------------------------------------ 크롤링
-    async def _crawl(self, status: Message, data: bytes, targets: list[Target]) -> SearchReport:
+    async def _crawl(
+        self,
+        status: Message,
+        data: bytes,
+        targets: list[Target],
+        max_posts: int | None = None,
+    ) -> SearchReport:
         if self._crawl_lock.locked():
             await self._edit_quietly(status, "다른 검색이 진행 중이에요. 끝나면 바로 시작할게요. ⏳")
         async with self._crawl_lock:
@@ -224,7 +279,7 @@ class InstaFinderBot:
                 progress["count"], progress["target"] = count, target
 
             task = asyncio.ensure_future(
-                asyncio.to_thread(self.crawl_finder.find, data, targets, on_progress)
+                asyncio.to_thread(self.crawl_finder.find, data, targets, on_progress, max_posts)
             )
             last_text = ""
             while True:
@@ -300,6 +355,8 @@ def main() -> None:
     settings = Settings.from_env()
     if not settings.telegram_bot_token:
         raise SystemExit("환경 변수(.env)를 설정하세요: TELEGRAM_BOT_TOKEN")
+    if settings.anthropic_api_key and not settings.crawl_enabled:
+        log.warning("AI 검색은 인스타그램 로그인(INSTAGRAM_USERNAME)이 있어야 동작합니다.")
     if not settings.lens_enabled and not settings.crawl_enabled:
         raise SystemExit(
             "검색 방식을 하나 이상 설정하세요: INSTAGRAM_USERNAME(크롤링) 또는 SERPAPI_API_KEY(Google Lens)"

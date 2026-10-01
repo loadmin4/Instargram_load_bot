@@ -62,7 +62,9 @@ class CrawlFinder:
         image_bytes: bytes,
         targets: list[Target],
         progress: ProgressCallback | None = None,
+        max_posts: int | None = None,
     ) -> SearchReport:
+        """max_posts 를 주면 이번 검색에 한해 대상 하나당 최대 게시물 수를 바꾼다."""
         if not targets:
             raise ValueError("검색할 계정(@아이디)이나 해시태그(#태그)를 하나 이상 지정하세요.")
         targets = targets[: self.options.max_targets]
@@ -79,7 +81,9 @@ class CrawlFinder:
             with ThreadPoolExecutor(max_workers=8) as pool:
                 for target in targets:
                     try:
-                        self._scan_target(target, query, pool, report, found, progress)
+                        self._scan_target(
+                            target, max_posts or self.options.max_posts, query, pool, report, found, progress
+                        )
                     except LoginError:
                         raise
                     except CrawlerError as exc:
@@ -104,6 +108,7 @@ class CrawlFinder:
     def _scan_target(
         self,
         target: Target,
+        limit: int,
         query: image_utils.QueryImage,
         pool: ThreadPoolExecutor,
         report: SearchReport,
@@ -111,7 +116,7 @@ class CrawlFinder:
         progress: ProgressCallback | None,
     ) -> None:
         batch: list[CrawledPost] = []
-        for post in self.session.iter_posts(target, self.options.max_posts):
+        for post in self.session.iter_posts(target, limit):
             batch.append(post)
             if len(batch) >= _BATCH_SIZE:
                 self._compare_batch(batch, query, pool, report, found)

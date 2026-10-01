@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "insta-finder"
-version = "0.2.0"
+version = "0.3.0"
 description = "사진으로 인스타그램 게시물과 올린 사용자를 찾는 봇"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -13,6 +13,7 @@ dependencies = [
     "Pillow>=10.0",
     "python-dotenv>=1.0",
     "instaloader>=4.14",
+    "anthropic>=1.11",
 ]
 
 [project.optional-dependencies]

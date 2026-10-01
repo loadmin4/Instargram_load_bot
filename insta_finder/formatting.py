@@ -73,7 +73,8 @@ def format_crawl_report(report: SearchReport) -> str:
 
 def format_report(report: SearchReport) -> str:
     if report.mode == "crawl":
-        return format_crawl_report(report)
+        text = format_crawl_report(report)
+        return f"{report.note}\n\n{text}" if report.note else text
     if not report.matches:
         return (
             "인스타그램에서 이 사진을 찾지 못했어요. 😢\n"

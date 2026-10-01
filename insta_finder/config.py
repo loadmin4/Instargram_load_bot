@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
+from .ai_targets import DEFAULT_MODEL as DEFAULT_AI_MODEL
 from .crawl_finder import CrawlOptions
 from .finder import FinderOptions
 
@@ -59,6 +60,9 @@ class Settings:
     instagram_password: str = field(repr=False)
     instagram_session_file: str
     crawl: CrawlOptions
+    anthropic_api_key: str = field(repr=False)
+    ai_model: str
+    ai_max_posts: int  # AI 가 고른 대상 하나당 비교할 최대 게시물 수
 
     @property
     def lens_enabled(self) -> bool:
@@ -67,6 +71,11 @@ class Settings:
     @property
     def crawl_enabled(self) -> bool:
         return bool(self.instagram_username)
+
+    @property
+    def ai_enabled(self) -> bool:
+        # AI 는 크롤링할 대상을 고르는 역할이라 인스타그램 로그인도 필요하다
+        return bool(self.anthropic_api_key) and self.crawl_enabled
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> Settings:
@@ -102,4 +111,7 @@ class Settings:
                 max_matches=max(0, _int(env.get("CRAWL_MAX_MATCHES"), 3)),
                 max_targets=max(1, _int(env.get("CRAWL_MAX_TARGETS"), 5)),
             ),
+            anthropic_api_key=env.get("ANTHROPIC_API_KEY", "").strip(),
+            ai_model=env.get("AI_MODEL", "").strip() or DEFAULT_AI_MODEL,
+            ai_max_posts=max(1, _int(env.get("AI_MAX_POSTS"), 100)),
         )
