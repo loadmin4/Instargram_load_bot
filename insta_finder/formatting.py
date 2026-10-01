@@ -11,7 +11,7 @@ _KIND_LABEL = {
     "story": "스토리",
     "profile": "프로필",
 }
-_TYPE_LABEL = {"exact_matches": "완전 일치", "visual_matches": "유사 이미지"}
+_TYPE_LABEL = {"crawl": "직접 비교", "exact_matches": "완전 일치", "visual_matches": "유사 이미지"}
 
 
 def _uploader(match: Match) -> str:
@@ -41,11 +41,39 @@ def format_match(index: int, match: Match) -> str:
         lines.append(f"   날짜: {match.date}")
     if match.title:
         title = match.title if len(match.title) <= 80 else match.title[:77] + "..."
-        lines.append(f"   제목: {title}")
+        lines.append(f"   {'캡션' if match.match_type == 'crawl' else '제목'}: {title}")
     return "\n".join(lines)
 
 
+def _format_errors(report: SearchReport) -> str:
+    return "\n".join(f"⚠️ {error}" for error in report.errors)
+
+
+def format_crawl_report(report: SearchReport) -> str:
+    targets = ", ".join(report.targets)
+    errors = _format_errors(report)
+    if not report.matches:
+        text = (
+            f"{targets} 의 게시물 {report.total_results}개를 비교했지만 같은 사진을 찾지 못했어요. 😢\n\n"
+            "팁: 다른 계정/해시태그를 지정하거나, CRAWL_MAX_POSTS 를 늘려 더 오래된 게시물까지 확인해 보세요."
+        )
+        return f"{text}\n\n{errors}" if errors else text
+    head = (
+        f"🔎 {targets} 의 게시물 {report.total_results}개를 비교해서 "
+        f"같은 사진 {len(report.matches)}건을 찾았어요."
+    )
+    body = "\n\n".join(format_match(i, m) for i, m in enumerate(report.matches, start=1))
+    footer = (
+        "※ 유사도는 사진끼리 비교한 점수예요. 90% 이상이면 같은 사진일 가능성이 높아요.\n"
+        "※ 최초 게시자가 아니라 퍼간 계정일 수도 있으니 날짜를 함께 확인하세요."
+    )
+    parts = [head, body, footer] + ([errors] if errors else [])
+    return "\n\n".join(parts)
+
+
 def format_report(report: SearchReport) -> str:
+    if report.mode == "crawl":
+        return format_crawl_report(report)
     if not report.matches:
         return (
             "인스타그램에서 이 사진을 찾지 못했어요. 😢\n"

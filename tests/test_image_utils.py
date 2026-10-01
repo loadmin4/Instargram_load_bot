@@ -39,20 +39,35 @@ def test_load_image_rejects_garbage():
 
 
 def test_similarity_same_photo_resized_and_recompressed(photo):
-    query = image_utils.image_hashes(photo)
+    query = image_utils.QueryImage(photo)
     thumb = photo.resize((160, 120))
     thumb = Image.open(io.BytesIO(to_bytes(thumb, quality=40)))
-    assert image_utils.best_similarity(query, thumb) >= 0.9
+    assert query.similarity(thumb) >= 0.9
 
 
-def test_similarity_same_photo_center_cropped(photo):
-    # 인스타그램/검색 썸네일처럼 정사각형으로 잘린 경우
-    query = image_utils.image_hashes(photo)
-    cropped = image_utils.center_crop_square(photo).resize((150, 150))
-    assert image_utils.best_similarity(query, cropped) >= 0.9
+@pytest.mark.parametrize("aspect", [1.0, 4 / 5, 1.91])
+def test_similarity_instagram_crops(aspect):
+    # 인스타그램은 1:1, 4:5, 1.91:1 로 잘라 올린다
+    original = make_image(seed=3, size=(1200, 1600))
+    query = image_utils.QueryImage(original)
+    cropped = image_utils.crop_to_aspect(original, aspect).resize((1080, round(1080 / aspect)))
+    assert query.similarity(cropped) >= 0.9
+
+
+def test_similarity_when_query_is_the_cropped_one():
+    # 반대로 내가 가진 사진이 잘린 사진이고 게시물이 원본인 경우
+    original = make_image(seed=4, size=(1600, 1200))
+    query = image_utils.QueryImage(image_utils.crop_to_aspect(original, 1.0))
+    assert query.similarity(original) >= 0.9
 
 
 def test_similarity_different_photo_is_low(photo):
-    query = image_utils.image_hashes(photo)
-    other = make_image(seed=42)
-    assert image_utils.best_similarity(query, other) < 0.8
+    query = image_utils.QueryImage(photo)
+    for seed in range(40, 50):
+        assert query.similarity(make_image(seed=seed)) < 0.75
+
+
+def test_crop_to_aspect():
+    image = Image.new("RGB", (1000, 500))
+    assert image_utils.crop_to_aspect(image, 1.0).size == (500, 500)
+    assert image_utils.crop_to_aspect(image, 4.0).size == (1000, 250)

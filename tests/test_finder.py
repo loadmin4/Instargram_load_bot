@@ -222,3 +222,25 @@ def test_report_to_dict_is_json_serializable(photo_bytes):
 def test_invalid_search_type():
     with pytest.raises(ValueError):
         FinderOptions(search_types=("products",))
+
+
+def test_resolve_usernames_prefers_instagram_session(photo_bytes):
+    lens = {"exact_matches": {"exact_matches": [EXACT["exact_matches"][1]]}}
+    server = FakeServer(photo_bytes, lens_responses=lens)
+    http = server.client()
+    lookups = []
+
+    def owner_lookup(shortcode):
+        lookups.append(shortcode)
+        return "gildong"
+
+    finder = PhotoFinder(
+        SerpApiClient(API_KEY, http=http),
+        FinderOptions(search_types=("exact_matches",), resolve_usernames=3),
+        http=http,
+        owner_lookup=owner_lookup,
+    )
+    report = finder.find(photo_bytes)
+    assert report.matches[0].username == "gildong"
+    assert lookups == ["C1a2B3c4D5e"]
+    assert server.count("google") == 0  # SerpApi 크레딧을 쓰지 않음

@@ -76,25 +76,64 @@ def dhash(image: Image.Image, hash_size: int = 8) -> int:
     return bits
 
 
-def center_crop_square(image: Image.Image) -> Image.Image:
-    side = min(image.size)
-    left = (image.width - side) // 2
-    top = (image.height - side) // 2
-    return image.crop((left, top, left + side, top + side))
-
-
-def image_hashes(image: Image.Image) -> tuple[int, int]:
-    """원본과 가운데 정사각형 크롭의 해시.
-
-    인스타그램/검색 썸네일은 정사각형으로 잘리는 경우가 많아 둘 다 비교한다.
-    """
-    return dhash(image), dhash(center_crop_square(image))
-
-
-def hash_similarity(a: int, b: int, bits: int = 64) -> float:
+def hash_similarity(a: int, b: int, bits: int) -> float:
     return 1.0 - bin(a ^ b).count("1") / bits
 
 
-def best_similarity(query_hashes: tuple[int, ...], candidate: Image.Image) -> float:
-    candidate_hashes = image_hashes(candidate)
-    return max(hash_similarity(q, c) for q in query_hashes for c in candidate_hashes)
+def crop_to_aspect(image: Image.Image, aspect: float) -> Image.Image:
+    """가운데를 기준으로 가로/세로 비율(aspect = 가로/세로)에 맞게 자른다."""
+    width, height = image.size
+    if width / height > aspect:
+        new_width = max(1, round(height * aspect))
+        left = (width - new_width) // 2
+        return image.crop((left, 0, left + new_width, height))
+    new_height = max(1, round(width / aspect))
+    top = (height - new_height) // 2
+    return image.crop((0, top, width, top + new_height))
+
+
+# 64비트(크기·압축 변화에 강함)와 256비트(서로 다른 사진을 더 잘 구분) 해시를 함께 쓴다
+_HASH_SIZES = (8, 16)
+_COMPARE_SIDE = 512
+
+
+def _hashes(image: Image.Image) -> tuple[int, ...]:
+    return tuple(dhash(image, size) for size in _HASH_SIZES)
+
+
+def _score(a: tuple[int, ...], b: tuple[int, ...]) -> float:
+    return sum(hash_similarity(x, y, size * size) for x, y, size in zip(a, b, _HASH_SIZES)) / len(
+        _HASH_SIZES
+    )
+
+
+class QueryImage:
+    """검색할 원본 사진. 후보 이미지와의 유사도(0.0~1.0)를 계산한다.
+
+    인스타그램은 사진을 1:1, 4:5 등으로 잘라 올리고 검색 썸네일도 잘려 있는 경우가 많으므로
+    원본 그대로, 원본을 후보 비율로 자른 것, 후보를 원본 비율로 자른 것 중 가장 높은 점수를 쓴다.
+    """
+
+    def __init__(self, image: Image.Image) -> None:
+        self.image = image.copy()
+        self.image.thumbnail((_COMPARE_SIDE, _COMPARE_SIDE), Image.Resampling.LANCZOS)
+        self.aspect = self.image.width / self.image.height
+        self._full = _hashes(self.image)
+        self._cropped: dict[float, tuple[int, ...]] = {}
+
+    def _hashes_for_aspect(self, aspect: float) -> tuple[int, ...]:
+        key = round(aspect, 2)
+        if key not in self._cropped:
+            self._cropped[key] = _hashes(crop_to_aspect(self.image, key))
+        return self._cropped[key]
+
+    def similarity(self, candidate: Image.Image) -> float:
+        candidate = candidate.copy()
+        candidate.thumbnail((_COMPARE_SIDE, _COMPARE_SIDE), Image.Resampling.LANCZOS)
+        candidate_aspect = candidate.width / candidate.height
+        candidate_hashes = _hashes(candidate)
+        scores = [_score(self._full, candidate_hashes)]
+        if abs(candidate_aspect - self.aspect) > 0.02:
+            scores.append(_score(self._hashes_for_aspect(candidate_aspect), candidate_hashes))
+            scores.append(_score(self._full, _hashes(crop_to_aspect(candidate, self.aspect))))
+        return max(scores)

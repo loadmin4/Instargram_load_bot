@@ -7,3 +7,6 @@ venv/
 .pytest_cache/
 dist/
 build/
+# 인스타그램 로그인 세션 (비밀번호와 같으므로 절대 커밋하지 말 것)
+*.session
+session-*

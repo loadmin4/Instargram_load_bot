@@ -6,19 +6,22 @@ import io
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import httpx
 from PIL import Image
 
 from . import image_utils, instagram
-from .models import MATCH_TYPE_PRIORITY, Match, SearchReport
-from .serpapi_client import SerpApiClient, SerpApiError
+from .models import Match, SearchReport
+from .serpapi_client import SerpApiClient
 
 log = logging.getLogger(__name__)
 
-VALID_SEARCH_TYPES = tuple(MATCH_TYPE_PRIORITY)
-_THUMBNAIL_MAX_BYTES = 5 * 1024 * 1024
+VALID_SEARCH_TYPES = ("exact_matches", "visual_matches")
+_IMAGE_MAX_BYTES = 10 * 1024 * 1024
+
+# 게시물 shortcode → 게시자 사용자 이름 (예: 로그인한 인스타그램 세션으로 조회)
+OwnerLookup = Callable[[str], "str | None"]
 
 
 @dataclass
@@ -26,7 +29,7 @@ class FinderOptions:
     search_types: tuple[str, ...] = ("exact_matches", "visual_matches")
     max_results: int = 10
     verify_thumbnails: bool = True
-    resolve_usernames: int = 0  # 사용자 이름이 없는 상위 N개 게시물을 Google 검색으로 보완
+    resolve_usernames: int = 0  # 사용자 이름이 없는 상위 N개 게시물의 게시자를 추가 조회
     query_hint: str | None = None  # Lens 에 함께 넘길 검색어 (예: "instagram")
 
     def __post_init__(self) -> None:
@@ -38,15 +41,20 @@ class FinderOptions:
 
 
 class PhotoFinder:
+    """Google Lens(SerpApi) 역이미지 검색으로 인스타그램 게시물을 찾는다."""
+
     def __init__(
         self,
         client: SerpApiClient,
         options: FinderOptions | None = None,
         http: httpx.Client | None = None,
+        owner_lookup: OwnerLookup | None = None,
     ) -> None:
         self.client = client
         self.options = options or FinderOptions()
         self._http = http or httpx.Client(timeout=15.0, follow_redirects=True)
+        # 지정하면 게시자 조회에 SerpApi Google 검색 대신 이것을 쓴다 (크레딧 절약)
+        self.owner_lookup = owner_lookup
 
     def close(self) -> None:
         self._http.close()
@@ -108,44 +116,51 @@ class PhotoFinder:
         return matches
 
     def _score_thumbnails(self, query_image: Image.Image, matches: list[Match]) -> None:
-        query_hashes = image_utils.image_hashes(query_image)
+        query = image_utils.QueryImage(query_image)
 
         def score(match: Match) -> None:
             if not match.thumbnail:
                 return
             try:
-                candidate = self._download_image(match.thumbnail)
-                match.similarity = round(image_utils.best_similarity(query_hashes, candidate), 3)
+                candidate = download_image(self._http, match.thumbnail)
+                match.similarity = round(query.similarity(candidate), 3)
             except Exception as exc:  # 썸네일 하나 실패해도 전체 검색은 계속
                 log.debug("썸네일 비교 실패 %s: %s", match.thumbnail, exc)
 
         with ThreadPoolExecutor(max_workers=8) as pool:
             list(pool.map(score, matches))
 
-    def _download_image(self, url: str) -> Image.Image:
-        if not url.startswith("https://"):
-            raise ValueError("https 썸네일만 내려받습니다.")
-        with self._http.stream("GET", url) as response:
-            response.raise_for_status()
-            chunks = []
-            size = 0
-            for chunk in response.iter_bytes():
-                size += len(chunk)
-                if size > _THUMBNAIL_MAX_BYTES:
-                    raise ValueError("썸네일이 너무 큽니다.")
-                chunks.append(chunk)
-        return image_utils.load_image(b"".join(chunks))
-
     def _resolve_usernames(self, matches: list[Match]) -> None:
-        """사용자 이름을 모르는 게시물은 Google 검색 스니펫에서 게시자를 찾는다."""
+        """사용자 이름을 모르는 게시물의 게시자를 찾는다.
+
+        owner_lookup(인스타그램 세션)이 있으면 그것을, 없으면 Google 검색 스니펫을 쓴다.
+        """
         pending = [m for m in sorted(matches, key=Match.sort_key) if m.ref.is_post and not m.username]
         for match in pending[: self.options.resolve_usernames]:
+            shortcode = match.ref.shortcode or ""
             try:
-                data = self.client.google(f'site:instagram.com "{match.ref.shortcode}"')
-            except SerpApiError as exc:
+                if self.owner_lookup is not None:
+                    match.username = self.owner_lookup(shortcode)
+                else:
+                    data = self.client.google(f'site:instagram.com "{shortcode}"')
+                    match.username = _username_from_google(data, shortcode)
+            except Exception as exc:  # 조회 실패는 결과에서 사용자 이름만 빠질 뿐
                 log.warning("게시자 조회 실패 (%s): %s", match.ref.url, exc)
-                continue
-            match.username = _username_from_google(data, match.ref.shortcode or "")
+
+
+def download_image(http: httpx.Client, url: str, max_bytes: int = _IMAGE_MAX_BYTES) -> Image.Image:
+    if not url.startswith("https://"):
+        raise ValueError("https 이미지만 내려받습니다.")
+    with http.stream("GET", url) as response:
+        response.raise_for_status()
+        chunks = []
+        size = 0
+        for chunk in response.iter_bytes():
+            size += len(chunk)
+            if size > max_bytes:
+                raise ValueError("이미지가 너무 큽니다.")
+            chunks.append(chunk)
+    return image_utils.load_image(b"".join(chunks))
 
 
 def _dedupe(matches: list[Match]) -> list[Match]:
